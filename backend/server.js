@@ -1,11 +1,22 @@
 
 const express = require("express");
+const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
+const PORT = process.env.PORT || 5001;
 
+// Allow requests from the TaskPilot AI frontend
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+  })
+);
+
+// Parse incoming JSON requests
 app.use(express.json());
 
+// Root endpoint
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -13,16 +24,16 @@ app.get("/", (req, res) => {
   });
 });
 
+// Health-check endpoint
 app.get("/api/health", (req, res) => {
-  res.status(200).json({
+  res.json({
     success: true,
     status: "healthy",
     service: "TaskPilot AI Backend",
   });
 });
 
-const PORT = process.env.PORT || 5001;
-
+// Start the server
 app.listen(PORT, () => {
-  console.log(`TaskPilot AI server running on port ${PORT}`);
+  console.log(`TaskPilot AI backend running on http://localhost:${PORT}`);
 });
