@@ -1,14 +1,21 @@
+
 let aiClient = null;
 
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1000;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function generateTaskResponse(prompt) {
-  // Make sure the API key is configured
   if (!process.env.GEMINI_API_KEY) {
     throw new Error(
       "GEMINI_API_KEY is missing from the backend environment."
     );
   }
 
-  // Load Google's SDK and initialize the client once
+  // Initialize the Gemini client once.
   if (!aiClient) {
     const { GoogleGenAI } = await import("@google/genai");
 
@@ -17,13 +24,38 @@ async function generateTaskResponse(prompt) {
     });
   }
 
-  // Send the task to Gemini
-  const response = await aiClient.models.generateContent({
-    model: "gemini-flash-latest",
-    contents: prompt,
-  });
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await aiClient.models.generateContent({
+        model: "gemini-3.5-flash-lite",
+        contents: prompt,
+        config: {
+          maxOutputTokens: 1024,
+        },
+      });
 
-  return response.text;
+      return response.text;
+    } catch (error) {
+      const errorMessage = String(error.message || error);
+      const isTemporaryError =
+        /\b(429|500|502|503|504)\b/.test(errorMessage) ||
+        /UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|TIMEOUT/i.test(
+          errorMessage
+        );
+
+      if (!isTemporaryError || attempt >= MAX_RETRIES) {
+        throw error;
+      }
+
+      const delay = RETRY_DELAY_MS * 2 ** attempt;
+
+      console.warn(
+        `Gemini temporary error. Retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms.`
+      );
+
+      await wait(delay);
+    }
+  }
 }
 
 module.exports = {

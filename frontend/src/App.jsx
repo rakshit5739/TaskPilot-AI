@@ -1,6 +1,9 @@
 
 import { useState } from "react";
-import { checkBackendHealth } from "./services/api";
+import {
+  checkBackendHealth,
+  sendTaskToAI,
+} from "./services/api";
 import "./App.css";
 
 const suggestions = [
@@ -29,9 +32,8 @@ function App() {
   const [task, setTask] = useState("");
   const [messages, setMessages] = useState([]);
   const [activeNav, setActiveNav] = useState("Workspace");
-
-  // Backend connection state
   const [backendStatus, setBackendStatus] = useState("Not tested");
+  const [isGenerating, setIsGenerating] = useState(false);
 
   async function testBackendConnection() {
     setBackendStatus("Checking...");
@@ -50,22 +52,62 @@ function App() {
     }
   }
 
-  function submitTask(value = task) {
+  async function submitTask(value = task) {
     const cleanTask = value.trim();
 
-    if (!cleanTask) return;
+    if (!cleanTask || isGenerating) return;
 
+    const messageId = `${Date.now()}-${Math.random()}`;
+
+    // Add the user's task immediately and mark it as processing.
     setMessages((previous) => [
       ...previous,
       {
-        id: Date.now(),
+        id: messageId,
         task: cleanTask,
-        response: true,
+        response: "",
+        status: "loading",
       },
     ]);
 
     setTask("");
     setActiveNav("Workspace");
+    setIsGenerating(true);
+
+    try {
+      // Ask our backend to generate a real Gemini response.
+      const aiResponse = await sendTaskToAI(cleanTask);
+
+      setMessages((previous) =>
+        previous.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                response: aiResponse,
+                status: "success",
+              }
+            : message
+        )
+      );
+    } catch (error) {
+      console.error("AI task error:", error);
+
+      setMessages((previous) =>
+        previous.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                response:
+                  error.message ||
+                  "Something went wrong. Please try again.",
+                status: "error",
+              }
+            : message
+        )
+      );
+    } finally {
+      setIsGenerating(false);
+    }
   }
 
   function startNewTask() {
@@ -75,6 +117,20 @@ function App() {
   }
 
   const backendConnected = backendStatus === "Connected";
+
+  function handleTaskKeyDown(event) {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
+      event.preventDefault();
+
+      if (!isGenerating) {
+        submitTask();
+      }
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -138,7 +194,7 @@ function App() {
                 <button
                   className="recent-item"
                   key={message.id}
-                  onClick={() => setActiveNav("Task history")}
+                  onClick={() => setActiveNav("Workspace")}
                 >
                   <span>↳</span>
                   <span>{message.task}</span>
@@ -212,6 +268,7 @@ function App() {
                       : "#fbbf24",
                 }}
               />
+
               {backendStatus === "Not tested"
                 ? "Backend not tested"
                 : backendStatus === "Checking..."
@@ -285,16 +342,7 @@ function App() {
                     <textarea
                       value={task}
                       onChange={(event) => setTask(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (
-                          event.key === "Enter" &&
-                          !event.shiftKey &&
-                          !event.nativeEvent.isComposing
-                        ) {
-                          event.preventDefault();
-                          submitTask();
-                        }
-                      }}
+                      onKeyDown={handleTaskKeyDown}
                       placeholder="Give your agent a task to work on..."
                       rows={2}
                       aria-label="Describe your task"
@@ -309,9 +357,10 @@ function App() {
                       <button
                         className="send-button"
                         type="submit"
-                        disabled={!task.trim()}
+                        disabled={!task.trim() || isGenerating}
                       >
-                        Run task <span>↑</span>
+                        {isGenerating ? "Thinking..." : "Run task"}
+                        <span>{isGenerating ? "…" : "↑"}</span>
                       </button>
                     </div>
                   </form>
@@ -326,6 +375,7 @@ function App() {
                       <button
                         className="suggestion-card"
                         key={suggestion.title}
+                        disabled={isGenerating}
                         onClick={() => submitTask(suggestion.prompt)}
                       >
                         <span className="suggestion-icon">
@@ -353,7 +403,7 @@ function App() {
                     </span>
                     <h1>Let's work through it.</h1>
                     <p>
-                      Your task has been added to this local demo workspace.
+                      TaskPilot is processing your requests with Gemini.
                     </p>
                   </div>
 
@@ -375,46 +425,52 @@ function App() {
                         <div className="response-heading">
                           <span className="response-mark">✳</span>
                           <strong>TaskPilot</strong>
-                          <span className="demo-badge">DEMO MODE</span>
+
+                          {message.status === "loading" && (
+                            <span className="demo-badge">
+                              THINKING
+                            </span>
+                          )}
+
+                          {message.status === "success" && (
+                            <span className="demo-badge">
+                              GEMINI AI
+                            </span>
+                          )}
+
+                          {message.status === "error" && (
+                            <span className="demo-badge">
+                              ERROR
+                            </span>
+                          )}
                         </div>
 
-                        <h3>
-                          Task received. Here's how we'll approach it.
-                        </h3>
-
-                        <p>
-                          A real AI-generated plan will appear here after we
-                          connect the Gemini API. For now, this interface is
-                          demonstrating the task workflow.
-                        </p>
-
-                        <div className="plan-preview">
-                          {[
-                            [
-                              "01",
-                              "Understand the goal",
-                              "Identify the desired outcome and constraints.",
-                            ],
-                            [
-                              "02",
-                              "Create a plan",
-                              "Break the task into clear, manageable steps.",
-                            ],
-                            [
-                              "03",
-                              "Execute and review",
-                              "Use approved tools and evaluate the results.",
-                            ],
-                          ].map(([number, title, description]) => (
-                            <div className="plan-row" key={number}>
-                              <span className="plan-number">{number}</span>
-                              <div>
-                                <strong>{title}</strong>
-                                <p>{description}</p>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
+                        {message.status === "loading" ? (
+                          <div
+                            className="ai-loading"
+                            role="status"
+                            aria-live="polite"
+                          >
+                            <span className="loading-indicator">✧</span>
+                            <p>Gemini is thinking about your task...</p>
+                          </div>
+                        ) : message.status === "error" ? (
+                          <div role="alert">
+                            <h3>We couldn't complete that request.</h3>
+                            <p>{message.response}</p>
+                            <button
+                              className="send-button"
+                              onClick={() => submitTask(message.task)}
+                              disabled={isGenerating}
+                            >
+                              Try again <span>↻</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="ai-response-text">
+                            {message.response}
+                          </div>
+                        )}
                       </div>
                     </article>
                   ))}
@@ -429,16 +485,7 @@ function App() {
                     <textarea
                       value={task}
                       onChange={(event) => setTask(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (
-                          event.key === "Enter" &&
-                          !event.shiftKey &&
-                          !event.nativeEvent.isComposing
-                        ) {
-                          event.preventDefault();
-                          submitTask();
-                        }
-                      }}
+                      onKeyDown={handleTaskKeyDown}
                       placeholder="Describe another task..."
                       rows={2}
                       aria-label="Add another task"
@@ -452,9 +499,10 @@ function App() {
                       <button
                         className="send-button"
                         type="submit"
-                        disabled={!task.trim()}
+                        disabled={!task.trim() || isGenerating}
                       >
-                        Send <span>↑</span>
+                        {isGenerating ? "Thinking..." : "Send"}
+                        <span>{isGenerating ? "…" : "↑"}</span>
                       </button>
                     </div>
                   </form>
