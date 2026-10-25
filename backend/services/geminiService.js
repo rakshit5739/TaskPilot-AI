@@ -8,7 +8,7 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function generateTaskResponse(prompt) {
+async function generateTaskResponse(prompt, history = []) {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error(
       "GEMINI_API_KEY is missing from the backend environment."
@@ -24,11 +24,16 @@ async function generateTaskResponse(prompt) {
     });
   }
 
+  const contents =
+    Array.isArray(history) && history.length > 0
+      ? [...history, { role: "user", parts: [{ text: prompt }] }]
+      : prompt;
+
   for (let attempt = 0; ; attempt++) {
     try {
       const response = await aiClient.models.generateContent({
         model: "gemini-3.5-flash-lite",
-        contents: prompt,
+        contents,
         config: {
           maxOutputTokens: 1024,
         },

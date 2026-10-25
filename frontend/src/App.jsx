@@ -1,108 +1,306 @@
-
-import { useState } from "react";
-import {
-  checkBackendHealth,
-  sendTaskToAI,
-} from "./services/api";
+import { useState, useEffect, useRef, useMemo } from "react";
+import Sidebar from "./components/Sidebar";
+import Topbar from "./components/Topbar";
+import WelcomeScreen from "./components/WelcomeScreen";
+import MessageItem from "./components/MessageItem";
+import Composer from "./components/Composer";
+import HistoryView from "./components/HistoryView";
+import CapabilitiesView from "./components/CapabilitiesView";
+import SettingsModal from "./components/SettingsModal";
+import { checkBackendHealth, sendTaskToAI } from "./services/api";
 import "./App.css";
 
-const suggestions = [
-  {
-    icon: "✧",
-    title: "Plan a project",
-    description: "Break a big goal into actionable steps",
-    prompt:
-      "Create a step-by-step plan to build a personal portfolio website.",
-  },
-  {
-    icon: "⌘",
-    title: "Research a topic",
-    description: "Organize research into useful findings",
-    prompt: "Create a research plan to understand how AI agents work.",
-  },
-  {
-    icon: "↗",
-    title: "Solve a problem",
-    description: "Think through a problem systematically",
-    prompt: "Help me create a practical weekly productivity plan.",
-  },
-];
+const SESSIONS_STORAGE_KEY = "brain_ai_sessions_v1";
+const LEGACY_SESSIONS_STORAGE_KEY = "taskpilot_sessions_v1";
+const ACTIVE_SESSION_STORAGE_KEY = "brain_ai_active_session_v1";
+const LEGACY_ACTIVE_SESSION_STORAGE_KEY = "taskpilot_active_session_v1";
 
-function App() {
-  const [task, setTask] = useState("");
-  const [messages, setMessages] = useState([]);
+function buildHistoryFromMessages(messages, upToMessageId = null) {
+  const history = [];
+  if (!Array.isArray(messages)) return history;
+
+  for (const m of messages) {
+    if (upToMessageId && m.id === upToMessageId) {
+      break;
+    }
+    if (
+      m.status === "success" &&
+      typeof m.task === "string" &&
+      typeof m.response === "string" &&
+      m.task.trim() &&
+      m.response.trim()
+    ) {
+      history.push({
+        role: "user",
+        parts: [{ text: m.task.trim() }],
+      });
+      history.push({
+        role: "model",
+        parts: [{ text: m.response.trim() }],
+      });
+    }
+  }
+
+  return history;
+}
+
+export default function App() {
+  // Session history persisted in localStorage with backward compatibility
+  const [sessions, setSessions] = useState(() => {
+    try {
+      const saved =
+        localStorage.getItem(SESSIONS_STORAGE_KEY) ||
+        localStorage.getItem(LEGACY_SESSIONS_STORAGE_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Restore active session ID or default to latest existing session
+  const [activeSessionId, setActiveSessionId] = useState(() => {
+    try {
+      const savedActive =
+        localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) ||
+        localStorage.getItem(LEGACY_ACTIVE_SESSION_STORAGE_KEY);
+      const savedSessions =
+        localStorage.getItem(SESSIONS_STORAGE_KEY) ||
+        localStorage.getItem(LEGACY_SESSIONS_STORAGE_KEY);
+      if (savedSessions) {
+        const parsed = JSON.parse(savedSessions);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          if (savedActive && parsed.some((s) => s.id === savedActive)) {
+            return savedActive;
+          }
+          return parsed[0].id;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  });
+
+  const activeSessionIdRef = useRef(activeSessionId);
+  const [taskInput, setTaskInput] = useState("");
   const [activeNav, setActiveNav] = useState("Workspace");
-  const [backendStatus, setBackendStatus] = useState("Not tested");
+  const [backendStatus, setBackendStatus] = useState("Checking...");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(() => {
+    return typeof window !== "undefined" ? window.innerWidth > 900 : true;
+  });
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
+
+  const messagesEndRef = useRef(null);
+  const scrollContainerRef = useRef(null);
+
+  // Sync sessions to localStorage (both keys preserved)
+  useEffect(() => {
+    try {
+      const serialized = JSON.stringify(sessions);
+      localStorage.setItem(SESSIONS_STORAGE_KEY, serialized);
+      localStorage.setItem(LEGACY_SESSIONS_STORAGE_KEY, serialized);
+    } catch (err) {
+      console.error("Failed to save sessions to localStorage:", err);
+    }
+  }, [sessions]);
+
+  // Sync activeSessionId to localStorage & ref
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+    try {
+      if (activeSessionId) {
+        localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, activeSessionId);
+        localStorage.setItem(LEGACY_ACTIVE_SESSION_STORAGE_KEY, activeSessionId);
+      } else {
+        localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+        localStorage.removeItem(LEGACY_ACTIVE_SESSION_STORAGE_KEY);
+      }
+    } catch (err) {
+      console.error("Failed to save activeSessionId to localStorage:", err);
+    }
+  }, [activeSessionId]);
+
+  // Check backend health on initial mount
+  useEffect(() => {
+    testBackendConnection();
+  }, []);
+
+  // Keyboard shortcut listener: Cmd+K / Ctrl+K for new task
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        startNewTask();
+      } else if (e.key === "Escape") {
+        setIsSettingsOpen(false);
+        if (window.innerWidth <= 768) {
+          setIsSidebarOpen(false);
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  // Current active session & its messages
+  const currentSession = useMemo(
+    () => sessions.find((s) => s.id === activeSessionId) || null,
+    [sessions, activeSessionId]
+  );
+  const currentMessages = useMemo(
+    () => (currentSession ? currentSession.messages : []),
+    [currentSession]
+  );
+
+  // Auto-scroll when messages change or loading completes
+  useEffect(() => {
+    if (autoScroll && messagesEndRef.current && currentMessages.length > 0) {
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [currentMessages, isGenerating, autoScroll]);
 
   async function testBackendConnection() {
     setBackendStatus("Checking...");
-
     try {
       const data = await checkBackendHealth();
-
-      if (data.success && data.status === "healthy") {
+      if (data && data.success && data.status === "healthy") {
         setBackendStatus("Connected");
       } else {
         setBackendStatus("Unexpected response");
       }
     } catch (error) {
       setBackendStatus("Connection failed");
-      console.error("Backend connection error:", error);
+      console.warn("Backend connection check failed:", error);
     }
   }
 
-  async function submitTask(value = task) {
-    const cleanTask = value.trim();
+  function startNewTask() {
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
+    setTaskInput("");
+    setActiveNav("Workspace");
+  }
 
-    if (!cleanTask || isGenerating) return;
+  function handleSelectSession(sessionId) {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+    setActiveNav("Workspace");
+  }
 
-    const messageId = `${Date.now()}-${Math.random()}`;
+  function handleDeleteSession(sessionId) {
+    setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    if (activeSessionIdRef.current === sessionId) {
+      activeSessionIdRef.current = null;
+      setActiveSessionId(null);
+    }
+  }
 
-    // Add the user's task immediately and mark it as processing.
-    setMessages((previous) => [
-      ...previous,
-      {
-        id: messageId,
-        task: cleanTask,
-        response: "",
-        status: "loading",
-      },
-    ]);
+  function handleClearAllSessions() {
+    setSessions([]);
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
+  }
 
-    setTask("");
+  async function submitTask(explicitPrompt) {
+    const promptToSend = (explicitPrompt !== undefined ? explicitPrompt : taskInput).trim();
+    if (!promptToSend || isGenerating) return;
+
+    // Use activeSessionIdRef to avoid stale closures during rapid state changes
+    let targetSessionId = activeSessionIdRef.current || activeSessionId;
+    const now = Date.now();
+    const newMessageId = `msg-${now}-${Math.random().toString(36).slice(2, 7)}`;
+
+    const newMsg = {
+      id: newMessageId,
+      task: promptToSend,
+      response: "",
+      status: "loading",
+      timestamp: now,
+    };
+
+    // If starting a brand new conversation without an active session
+    if (!targetSessionId) {
+      targetSessionId = `session-${now}`;
+      activeSessionIdRef.current = targetSessionId;
+      setActiveSessionId(targetSessionId);
+
+      const title =
+        promptToSend.length > 42
+          ? promptToSend.slice(0, 40) + "..."
+          : promptToSend;
+
+      const newSession = {
+        id: targetSessionId,
+        title,
+        createdAt: now,
+        messages: [newMsg],
+      };
+
+      setSessions((prev) => [newSession, ...prev]);
+    } else {
+      // Append new user message to existing active session
+      activeSessionIdRef.current = targetSessionId;
+      setActiveSessionId(targetSessionId);
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === targetSessionId
+            ? { ...s, messages: [...s.messages, newMsg] }
+            : s
+        )
+      );
+    }
+
+    // Build context history from completed messages in the target session only
+    const existingSession = sessions.find((s) => s.id === targetSessionId);
+    const history = buildHistoryFromMessages(
+      existingSession ? existingSession.messages : []
+    );
+
+    setTaskInput("");
     setActiveNav("Workspace");
     setIsGenerating(true);
 
     try {
-      // Ask our backend to generate a real Gemini response.
-      const aiResponse = await sendTaskToAI(cleanTask);
+      const aiResponse = await sendTaskToAI(promptToSend, history);
 
-      setMessages((previous) =>
-        previous.map((message) =>
-          message.id === messageId
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === targetSessionId
             ? {
-                ...message,
-                response: aiResponse,
-                status: "success",
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === newMessageId
+                    ? { ...m, response: aiResponse, status: "success" }
+                    : m
+                ),
               }
-            : message
+            : s
         )
       );
     } catch (error) {
-      console.error("AI task error:", error);
+      console.error("Task execution error:", error);
 
-      setMessages((previous) =>
-        previous.map((message) =>
-          message.id === messageId
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === targetSessionId
             ? {
-                ...message,
-                response:
-                  error.message ||
-                  "Something went wrong. Please try again.",
-                status: "error",
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === newMessageId
+                    ? {
+                        ...m,
+                        response:
+                          error.message ||
+                          "Could not connect to the backend or AI service. Please verify your connection and try again.",
+                        status: "error",
+                      }
+                    : m
+                ),
               }
-            : message
+            : s
         )
       );
     } finally {
@@ -110,435 +308,205 @@ function App() {
     }
   }
 
-  function startNewTask() {
-    setMessages([]);
-    setTask("");
-    setActiveNav("Workspace");
+  async function handleRetry(taskText, messageId) {
+    if (isGenerating) return;
+    const targetSessionId = activeSessionIdRef.current || activeSessionId;
+    if (!targetSessionId) {
+      submitTask(taskText);
+      return;
+    }
+
+    if (messageId) {
+      setIsGenerating(true);
+      const existingSession = sessions.find((s) => s.id === targetSessionId);
+      const history = buildHistoryFromMessages(
+        existingSession ? existingSession.messages : [],
+        messageId
+      );
+
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === targetSessionId
+            ? {
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === messageId
+                    ? { ...m, response: "", status: "loading" }
+                    : m
+                ),
+              }
+            : s
+        )
+      );
+
+      try {
+        const aiResponse = await sendTaskToAI(taskText, history);
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === messageId
+                      ? { ...m, response: aiResponse, status: "success" }
+                      : m
+                  ),
+                }
+              : s
+          )
+        );
+      } catch (error) {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === targetSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === messageId
+                      ? {
+                          ...m,
+                          response: error.message || "Failed to regenerate response.",
+                          status: "error",
+                        }
+                      : m
+                  ),
+                }
+              : s
+          )
+        );
+      } finally {
+        setIsGenerating(false);
+      }
+    } else {
+      submitTask(taskText);
+    }
   }
 
-  const backendConnected = backendStatus === "Connected";
-
-  function handleTaskKeyDown(event) {
-    if (
-      event.key === "Enter" &&
-      !event.shiftKey &&
-      !event.nativeEvent.isComposing
-    ) {
-      event.preventDefault();
-
-      if (!isGenerating) {
-        submitTask();
-      }
-    }
+  function handleSelectSuggestion(suggestionPrompt) {
+    submitTask(suggestionPrompt);
   }
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <button className="brand" onClick={startNewTask}>
-          <span className="brand-mark">
-            <span>✳</span>
-          </span>
+      {/* Sidebar Navigation */}
+      <Sidebar
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+        activeNav={activeNav}
+        onSelectNav={setActiveNav}
+        onNewTask={startNewTask}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        backendStatus={backendStatus}
+      />
 
-          <span className="brand-copy">
-            <strong>
-              TaskPilot<span> AI</span>
-            </strong>
-            <small>YOUR INTELLIGENT WORKSPACE</small>
-          </span>
-        </button>
+      {/* Main Content Area */}
+      <div className="main-viewport">
+        <Topbar
+          activeNav={activeNav}
+          currentChatTitle={currentSession ? currentSession.title : null}
+          backendStatus={backendStatus}
+          onCheckBackend={testBackendConnection}
+          onNewTask={startNewTask}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          isSidebarOpen={isSidebarOpen}
+          onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
+        />
 
-        <button className="new-task-button" onClick={startNewTask}>
-          <span>＋</span> New task
-          <span className="shortcut">⌘ K</span>
-        </button>
-
-        <div className="nav-label">WORKSPACE</div>
-
-        <nav className="navigation">
-          {[
-            ["Workspace", "◈"],
-            ["Task history", "◷"],
-            ["Tools & agents", "✧"],
-          ].map(([label, icon]) => (
-            <button
-              key={label}
-              className={`nav-item ${
-                activeNav === label ? "active" : ""
-              }`}
-              onClick={() => setActiveNav(label)}
-            >
-              <span className="nav-icon">{icon}</span>
-              {label}
-
-              {label === "Task history" && messages.length > 0 && (
-                <span className="nav-count">{messages.length}</span>
-              )}
-            </button>
-          ))}
-        </nav>
-
-        <div className="sidebar-divider" />
-        <div className="nav-label">RECENT ACTIVITY</div>
-
-        <div className="recent-list">
-          {messages.length === 0 ? (
-            <p className="empty-recent">
-              Your recent tasks will appear here.
-            </p>
-          ) : (
-            messages
-              .slice(-5)
-              .reverse()
-              .map((message) => (
-                <button
-                  className="recent-item"
-                  key={message.id}
-                  onClick={() => setActiveNav("Workspace")}
-                >
-                  <span>↳</span>
-                  <span>{message.task}</span>
-                </button>
-              ))
-          )}
-        </div>
-
-        <div className="sidebar-bottom">
-          <div className="system-card">
-            <div className="system-heading">
-              <span className="status-dot" />
-              <span>LOCAL SYSTEM</span>
-              <span className="system-live">READY</span>
-            </div>
-
-            <div className="system-caption">
-              Interface operational
-            </div>
-
-            <div className="system-bars">
-              {[
-                35, 55, 42, 76, 48, 88, 62, 38, 72,
-                52, 91, 44, 68, 36, 59, 81, 47, 70,
-              ].map((height, index) => (
-                <span
-                  key={index}
-                  style={{ height: `${height}%` }}
-                />
-              ))}
-            </div>
-          </div>
-
-          <button
-            className="profile-button"
-            onClick={() => setActiveNav("Settings")}
-          >
-            <span className="avatar">TP</span>
-
-            <span className="profile-copy">
-              <strong>TaskPilot User</strong>
-              <small>Personal workspace</small>
-            </span>
-
-            <span className="profile-menu">···</span>
-          </button>
-        </div>
-      </aside>
-
-      <main className="main-panel">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span>TaskPilot AI</span>
-            <span className="breadcrumb-slash">/</span>
-            <strong>{activeNav}</strong>
-          </div>
-
-          <div className="topbar-right">
-            <span
-              className="connection-status"
-              aria-live="polite"
-              title="Backend connection status"
-            >
-              <span
-                className="status-dot"
-                style={{
-                  backgroundColor: backendConnected
-                    ? "#4ade80"
-                    : backendStatus === "Connection failed"
-                      ? "#f87171"
-                      : "#fbbf24",
-                }}
-              />
-
-              {backendStatus === "Not tested"
-                ? "Backend not tested"
-                : backendStatus === "Checking..."
-                  ? "Connecting..."
-                  : backendStatus === "Connected"
-                    ? "Backend connected"
-                    : backendStatus}
-            </span>
-
-            <span className="topbar-divider" />
-
-            <button
-              className="icon-button"
-              title="Test backend connection"
-              aria-label="Test backend connection"
-              onClick={testBackendConnection}
-              disabled={backendStatus === "Checking..."}
-            >
-              ↻
-            </button>
-
-            <button
-              className="icon-button"
-              title="New task"
-              aria-label="New task"
-              onClick={startNewTask}
-            >
-              ↗
-            </button>
-          </div>
-        </header>
-
-        <section className="workspace">
+        <main className="workspace-area">
           {activeNav === "Workspace" ? (
-            <>
-              {messages.length === 0 ? (
-                <div className="welcome-section">
-                  <div className="orbital-logo">
-                    <div className="orbital-ring ring-one" />
-                    <div className="orbital-ring ring-two" />
-                    <div className="orbital-core">✳</div>
-                    <span className="orbit-point point-one" />
-                    <span className="orbit-point point-two" />
-                  </div>
-
-                  <div className="eyebrow">
-                    <span className="eyebrow-line" />
-                    YOUR AI, READY FOR ACTION
-                    <span className="eyebrow-line" />
-                  </div>
-
-                  <h1>
-                    Good to see you.
-                    <br />
-                    <span>What are we building today?</span>
-                  </h1>
-
-                  <p className="welcome-description">
-                    Give TaskPilot a goal. We'll build toward an intelligent
-                    agent that can plan, reason, and use tools to get work
-                    done.
-                  </p>
-
-                  <form
-                    className="task-composer"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      submitTask();
-                    }}
-                  >
-                    <textarea
-                      value={task}
-                      onChange={(event) => setTask(event.target.value)}
-                      onKeyDown={handleTaskKeyDown}
-                      placeholder="Give your agent a task to work on..."
-                      rows={2}
-                      aria-label="Describe your task"
-                    />
-
-                    <div className="composer-footer">
-                      <div className="composer-hint">
-                        <span className="hint-symbol">✧</span>
-                        Clear goals lead to better plans
-                      </div>
-
-                      <button
-                        className="send-button"
-                        type="submit"
-                        disabled={!task.trim() || isGenerating}
-                      >
-                        {isGenerating ? "Thinking..." : "Run task"}
-                        <span>{isGenerating ? "…" : "↑"}</span>
-                      </button>
-                    </div>
-                  </form>
-
-                  <div className="suggestion-heading">
-                    <span>NOT SURE WHERE TO START?</span>
-                    <span className="suggestion-line" />
-                  </div>
-
-                  <div className="suggestion-grid">
-                    {suggestions.map((suggestion) => (
-                      <button
-                        className="suggestion-card"
-                        key={suggestion.title}
-                        disabled={isGenerating}
-                        onClick={() => submitTask(suggestion.prompt)}
-                      >
-                        <span className="suggestion-icon">
-                          {suggestion.icon}
-                        </span>
-
-                        <span className="suggestion-title">
-                          {suggestion.title}
-                        </span>
-
-                        <span className="suggestion-description">
-                          {suggestion.description}
-                        </span>
-
-                        <span className="suggestion-arrow">↗</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="conversation">
-                  <div className="conversation-heading">
-                    <span className="conversation-kicker">
-                      TASK WORKSPACE
-                    </span>
-                    <h1>Let's work through it.</h1>
-                    <p>
-                      TaskPilot is processing your requests with Gemini.
-                    </p>
-                  </div>
-
-                  {messages.map((message) => (
-                    <article
-                      className="message-block"
-                      key={message.id}
-                    >
-                      <div className="message-user">
-                        <span className="avatar small-avatar">YOU</span>
-
-                        <div>
-                          <span className="message-label">YOUR TASK</span>
-                          <p>{message.task}</p>
-                        </div>
-                      </div>
-
-                      <div className="agent-response">
-                        <div className="response-heading">
-                          <span className="response-mark">✳</span>
-                          <strong>TaskPilot</strong>
-
-                          {message.status === "loading" && (
-                            <span className="demo-badge">
-                              THINKING
-                            </span>
-                          )}
-
-                          {message.status === "success" && (
-                            <span className="demo-badge">
-                              GEMINI AI
-                            </span>
-                          )}
-
-                          {message.status === "error" && (
-                            <span className="demo-badge">
-                              ERROR
-                            </span>
-                          )}
-                        </div>
-
-                        {message.status === "loading" ? (
-                          <div
-                            className="ai-loading"
-                            role="status"
-                            aria-live="polite"
-                          >
-                            <span className="loading-indicator">✧</span>
-                            <p>Gemini is thinking about your task...</p>
-                          </div>
-                        ) : message.status === "error" ? (
-                          <div role="alert">
-                            <h3>We couldn't complete that request.</h3>
-                            <p>{message.response}</p>
-                            <button
-                              className="send-button"
-                              onClick={() => submitTask(message.task)}
-                              disabled={isGenerating}
-                            >
-                              Try again <span>↻</span>
-                            </button>
-                          </div>
-                        ) : (
-                          <div className="ai-response-text">
-                            {message.response}
-                          </div>
-                        )}
-                      </div>
-                    </article>
-                  ))}
-
-                  <form
-                    className="task-composer followup-composer"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      submitTask();
-                    }}
-                  >
-                    <textarea
-                      value={task}
-                      onChange={(event) => setTask(event.target.value)}
-                      onKeyDown={handleTaskKeyDown}
-                      placeholder="Describe another task..."
-                      rows={2}
-                      aria-label="Add another task"
-                    />
-
-                    <div className="composer-footer">
-                      <span className="composer-hint">
-                        Shift + Enter for a new line
+            currentMessages.length === 0 ? (
+              /* Beautiful Centered Welcome Screen */
+              <div className="scroll-wrapper welcome-scroll">
+                <WelcomeScreen
+                  taskInput={taskInput}
+                  onTaskChange={setTaskInput}
+                  onSubmitTask={(prompt) => submitTask(prompt)}
+                  onSelectSuggestion={handleSelectSuggestion}
+                  isGenerating={isGenerating}
+                />
+              </div>
+            ) : (
+              /* Multi-Turn Conversation Thread */
+              <div className="conversation-container">
+                <div className="scroll-wrapper chat-scroll" ref={scrollContainerRef}>
+                  <div className="chat-thread-inner">
+                    <div className="conversation-header-strip">
+                      <h2 className="thread-title">
+                        {currentSession?.title || "Active Discussion"}
+                      </h2>
+                      <span className="thread-subtitle">
+                        Brain AI execution thread
                       </span>
-
-                      <button
-                        className="send-button"
-                        type="submit"
-                        disabled={!task.trim() || isGenerating}
-                      >
-                        {isGenerating ? "Thinking..." : "Send"}
-                        <span>{isGenerating ? "…" : "↑"}</span>
-                      </button>
                     </div>
-                  </form>
+
+                    {currentMessages.map((msg) => (
+                      <MessageItem
+                        key={msg.id}
+                        message={msg}
+                        onRetry={handleRetry}
+                        isGenerating={isGenerating}
+                      />
+                    ))}
+
+                    <div ref={messagesEndRef} className="scroll-anchor" />
+                  </div>
                 </div>
-              )}
-            </>
-          ) : (
-            <div className="placeholder-view">
-              <div className="placeholder-icon">✳</div>
-              <span className="conversation-kicker">TASKPILOT AI</span>
-              <h1>{activeNav}</h1>
 
-              <p>
-                This section is part of the workspace design. We'll implement
-                its functionality as the agent evolves.
-              </p>
-
-              <button className="send-button" onClick={startNewTask}>
-                Return to workspace <span>↗</span>
-              </button>
+                {/* Pinned Bottom Composer */}
+                <div className="chat-pinned-composer">
+                  <div className="pinned-composer-inner">
+                    <Composer
+                      value={taskInput}
+                      onChange={setTaskInput}
+                      onSubmit={(prompt) => submitTask(prompt)}
+                      isGenerating={isGenerating}
+                      placeholder="Follow up or give another task... (Shift + Enter for new line)"
+                    />
+                    <div className="composer-disclaimer">
+                      Brain AI helps you plan and execute tasks. Review important information.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )
+          ) : activeNav === "Task history" ? (
+            <div className="scroll-wrapper">
+              <HistoryView
+                sessions={sessions}
+                onSelectSession={handleSelectSession}
+                onDeleteSession={handleDeleteSession}
+                onClearAllSessions={handleClearAllSessions}
+                onNewTask={startNewTask}
+              />
             </div>
-          )}
+          ) : activeNav === "Tools & agents" ? (
+            <div className="scroll-wrapper">
+              <CapabilitiesView
+                onStartWithPrompt={(prompt) => {
+                  setActiveNav("Workspace");
+                  submitTask(prompt);
+                }}
+                backendStatus={backendStatus}
+              />
+            </div>
+          ) : null}
+        </main>
+      </div>
 
-          <footer className="workspace-footer">
-            <span>
-              <span className="footer-dot" /> Built for thoughtful execution
-            </span>
-            <span>
-              TaskPilot AI <span className="footer-separator">·</span> Early
-              access
-            </span>
-          </footer>
-        </section>
-      </main>
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        backendStatus={backendStatus}
+        onCheckBackend={testBackendConnection}
+        onClearAllSessions={handleClearAllSessions}
+        autoScroll={autoScroll}
+        onToggleAutoScroll={setAutoScroll}
+      />
     </div>
   );
 }
-
-export default App;
